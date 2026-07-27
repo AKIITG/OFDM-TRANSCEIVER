@@ -1,0 +1,235 @@
+clear all; clc;
+
+%% ============================================================
+%  OFDM BER SIMULATION — BPSK and QPSK
+%  Compares simulated vs theoretical Bit Error Rate (BER)
+%  over AWGN channel with upsampling and LPF filtering
+% =============================================================
+
+%% -------------------------
+%  System Parameters
+% --------------------------
+nFFT        = 128;          % FFT size (number of subcarriers)
+nBpsk_Ofdm  = 128;          % Number of BPSK symbols per OFDM symbol
+nBit_Sym    = 128;          % Number of bits per OFDM symbol (= nBpsk_Ofdm for BPSK)
+nSym        = 10^4;         % Total number of OFDM symbols
+CP_len      = 32;           % Cyclic Prefix length
+upsample_factor = 8;        % Upsampling factor
+
+EbN0dB  = 0:0.5:12;        % Eb/N0 range in dB
+
+% Convert Eb/N0 to Es/N0 for each modulation scheme
+EsN0dB_bpsk = EbN0dB + 10*log10(nBpsk_Ofdm/nFFT) - 10*log10(upsample_factor);
+EsN0dB_qpsk = EbN0dB + 10*log10(2)               - 10*log10(upsample_factor);
+
+%% -------------------------
+%  Low-Pass Filter Design
+%  Passband: 0 - 3.5 MHz
+%  Stopband: 4.5 MHz+
+%  Sampling rate: 24 MHz
+% --------------------------
+[n, f, a, w] = firpmord([3.5e6 4.5e6], [1, 0], [0.005, 0.001], 24e6);
+Hd = firpm(n, f, a, w);    % FIR filter coefficients (Parks-McClellan)
+
+%% -------------------------
+%  Pre-allocate Error Arrays
+% --------------------------
+nErr_bpsk = zeros(1, length(EbN0dB));
+nErr_qpsk = zeros(1, length(EbN0dB));
+
+%% ============================================================
+%  MAIN SIMULATION LOOP
+% =============================================================
+for ii = 1:length(EbN0dB)
+
+    %% -------------------------------------------------------
+    %  TRANSMITTER
+    % --------------------------------------------------------
+
+    % Generate random bit stream
+    s_bit = round(rand(1, nBit_Sym * nSym));
+
+    % --- BPSK Modulation: 0 → -1, 1 → +1 ---
+    s_bpsk = 2*s_bit - 1;
+    s_bpsk = reshape(s_bpsk, nBit_Sym, nSym).';        % [nSym x nBit_Sym]
+
+    % --- QPSK Modulation: I + jQ ---
+    I_bit  = 2*(s_bit(1:2:end) - 0.5);
+    Q_bit  = 2*(s_bit(2:2:end) - 0.5);
+    s_qpsk = I_bit + 1j*Q_bit;
+    s_qpsk = reshape(s_qpsk, nBit_Sym, nSym/2).';      % [nSym/2 x nBit_Sym]
+
+    % --- OFDM Modulation via IFFT ---
+    s_ofdm_bpsk = (nFFT/sqrt(nBpsk_Ofdm))   * ifft(fftshift(s_bpsk.')).';
+    s_ofdm_qpsk = (nFFT/sqrt(nBpsk_Ofdm/2)) * ifft(fftshift(s_qpsk.')).';
+
+    % --- Add Cyclic Prefix (CP length = 32) ---
+    s_cp_bpsk = [s_ofdm_bpsk(:, end-CP_len+1:end), s_ofdm_bpsk];
+    s_cp_qpsk = [s_ofdm_qpsk(:, end-CP_len+1:end), s_ofdm_qpsk];
+
+    % --- Serialize: reshape into 1D stream ---
+    sym_len   = nFFT + CP_len;                          % 160 samples per symbol
+    s_cp_bpsk = reshape(s_cp_bpsk.', 1, nSym    * sym_len);
+    s_cp_qpsk = reshape(s_cp_qpsk.', 1, nSym/2  * sym_len);
+
+    % --- Separate I and Q branches ---
+    s_I_bpsk = real(s_cp_bpsk);   s_Q_bpsk = imag(s_cp_bpsk);
+    s_I_qpsk = real(s_cp_qpsk);   s_Q_qpsk = imag(s_cp_qpsk);
+
+    % --- Upsample by factor of 8 ---
+    s_Iup_bpsk = upsample(s_I_bpsk, upsample_factor);
+    s_Qup_bpsk = upsample(s_Q_bpsk, upsample_factor);
+    s_Iup_qpsk = upsample(s_I_qpsk, upsample_factor);
+    s_Qup_qpsk = upsample(s_Q_qpsk, upsample_factor);
+
+    % Reshape for per-symbol filtering
+    s_Iup_bpsk = reshape(s_Iup_bpsk, upsample_factor*sym_len, nSym   ).';
+    s_Qup_bpsk = reshape(s_Qup_bpsk, upsample_factor*sym_len, nSym   ).';
+    s_Iup_qpsk = reshape(s_Iup_qpsk, upsample_factor*sym_len, nSym/2 ).';
+    s_Qup_qpsk = reshape(s_Qup_qpsk, upsample_factor*sym_len, nSym/2 ).';
+
+    % --- TX Low-Pass Filter (convolution per symbol) ---
+    filt_len = sym_len*upsample_factor + n;             % output length after conv
+
+    s_I_filt_bpsk = zeros(nSym,   filt_len);
+    s_Q_filt_bpsk = zeros(nSym,   filt_len);
+    s_I_filt_qpsk = zeros(nSym/2, filt_len);
+    s_Q_filt_qpsk = zeros(nSym/2, filt_len);
+
+    for j = 1:nSym
+        s_I_filt_bpsk(j,:) = conv(s_Iup_bpsk(j,:), Hd);
+        s_Q_filt_bpsk(j,:) = conv(s_Qup_bpsk(j,:), Hd);
+    end
+    for j = 1:nSym/2
+        s_I_filt_qpsk(j,:) = conv(s_Iup_qpsk(j,:), Hd);
+        s_Q_filt_qpsk(j,:) = conv(s_Qup_qpsk(j,:), Hd);
+    end
+
+    % Remove filter edge effects (trim n/2 from each side)
+    trim = n/2;
+    s_I_filt_bpsk = s_I_filt_bpsk(:, trim+1:end-trim);
+    s_Q_filt_bpsk = s_Q_filt_bpsk(:, trim+1:end-trim);
+    s_I_filt_qpsk = s_I_filt_qpsk(:, trim+1:end-trim);
+    s_Q_filt_qpsk = s_Q_filt_qpsk(:, trim+1:end-trim);
+
+    % Serialize filtered signals
+    s_I_filt_bpsk = reshape(s_I_filt_bpsk.', 1, upsample_factor*nSym   *sym_len);
+    s_Q_filt_bpsk = reshape(s_Q_filt_bpsk.', 1, upsample_factor*nSym   *sym_len);
+    s_I_filt_qpsk = reshape(s_I_filt_qpsk.', 1, upsample_factor*nSym/2 *sym_len);
+    s_Q_filt_qpsk = reshape(s_Q_filt_qpsk.', 1, upsample_factor*nSym/2 *sym_len);
+
+    % Combine I and Q into complex baseband signal
+    s_tx_bpsk = s_I_filt_bpsk + 1j*s_Q_filt_bpsk;
+    s_tx_qpsk = s_I_filt_qpsk + 1j*s_Q_filt_qpsk;
+
+    %% -------------------------------------------------------
+    %  CHANNEL: AWGN
+    % --------------------------------------------------------
+    s_rx_bpsk = awgn(s_tx_bpsk, EsN0dB_bpsk(ii), 'measured');
+    s_rx_qpsk = awgn(s_tx_qpsk, EsN0dB_qpsk(ii), 'measured');
+
+    %% -------------------------------------------------------
+    %  RECEIVER
+    % --------------------------------------------------------
+
+    % --- Separate I and Q ---
+    r_I_bpsk = real(s_rx_bpsk);   r_Q_bpsk = imag(s_rx_bpsk);
+    r_I_qpsk = real(s_rx_qpsk);   r_Q_qpsk = imag(s_rx_qpsk);
+
+    % Reshape for per-symbol processing
+    r_I_bpsk = reshape(r_I_bpsk, upsample_factor*sym_len, nSym   ).';
+    r_Q_bpsk = reshape(r_Q_bpsk, upsample_factor*sym_len, nSym   ).';
+    r_I_qpsk = reshape(r_I_qpsk, upsample_factor*sym_len, nSym/2 ).';
+    r_Q_qpsk = reshape(r_Q_qpsk, upsample_factor*sym_len, nSym/2 ).';
+
+    % --- RX Low-Pass Filter ---
+    r_I_filt_bpsk = zeros(nSym,   filt_len);
+    r_Q_filt_bpsk = zeros(nSym,   filt_len);
+    r_I_filt_qpsk = zeros(nSym/2, filt_len);
+    r_Q_filt_qpsk = zeros(nSym/2, filt_len);
+
+    for j = 1:nSym
+        r_I_filt_bpsk(j,:) = conv(r_I_bpsk(j,:), Hd);
+        r_Q_filt_bpsk(j,:) = conv(r_Q_bpsk(j,:), Hd);
+    end
+    for j = 1:nSym/2
+        r_I_filt_qpsk(j,:) = conv(r_I_qpsk(j,:), Hd);
+        r_Q_filt_qpsk(j,:) = conv(r_Q_qpsk(j,:), Hd);
+    end
+
+    % Trim filter edges
+    r_I_filt_bpsk = r_I_filt_bpsk(:, trim+1:end-trim);
+    r_Q_filt_bpsk = r_Q_filt_bpsk(:, trim+1:end-trim);
+    r_I_filt_qpsk = r_I_filt_qpsk(:, trim+1:end-trim);
+    r_Q_filt_qpsk = r_Q_filt_qpsk(:, trim+1:end-trim);
+
+    % Serialize
+    r_I_filt_bpsk = reshape(r_I_filt_bpsk.', 1, upsample_factor*nSym   *sym_len);
+    r_Q_filt_bpsk = reshape(r_Q_filt_bpsk.', 1, upsample_factor*nSym   *sym_len);
+    r_I_filt_qpsk = reshape(r_I_filt_qpsk.', 1, upsample_factor*nSym/2 *sym_len);
+    r_Q_filt_qpsk = reshape(r_Q_filt_qpsk.', 1, upsample_factor*nSym/2 *sym_len);
+
+    % --- Downsample by factor of 8 ---
+    r_Idown_bpsk = downsample(r_I_filt_bpsk, upsample_factor);
+    r_Qdown_bpsk = downsample(r_Q_filt_bpsk, upsample_factor);
+    r_Idown_qpsk = downsample(r_I_filt_qpsk, upsample_factor);
+    r_Qdown_qpsk = downsample(r_Q_filt_qpsk, upsample_factor);
+
+    % Combine I + jQ
+    r_cplx_bpsk = r_Idown_bpsk + 1j*r_Qdown_bpsk;
+    r_cplx_qpsk = r_Idown_qpsk + 1j*r_Qdown_qpsk;
+
+    % Reshape into symbol matrix
+    r_cp_bpsk = reshape(r_cplx_bpsk, sym_len, nSym   ).';
+    r_cp_qpsk = reshape(r_cplx_qpsk, sym_len, nSym/2 ).';
+
+    % --- Remove Cyclic Prefix ---
+    r_fft_bpsk = r_cp_bpsk(:, CP_len+1:end);
+    r_fft_qpsk = r_cp_qpsk(:, CP_len+1:end);
+
+    % --- OFDM Demodulation via FFT ---
+    r_F_bpsk = (sqrt(nBpsk_Ofdm)   /nFFT) * fftshift(fft(r_fft_bpsk.')).';
+    r_F_qpsk = (sqrt(nBpsk_Ofdm/2) /nFFT) * fftshift(fft(r_fft_qpsk.')).';
+
+    % --- BPSK Demodulation: +value → 1, -value → 0 ---
+    r_demod_bpsk = real(r_F_bpsk);
+    r_demod_bpsk(r_demod_bpsk > 0) = +1;
+    r_demod_bpsk(r_demod_bpsk < 0) = -1;
+    r_bit_bpsk = (r_demod_bpsk + 1) / 2;
+    r_bit_bpsk = reshape(r_bit_bpsk.', 1, nBit_Sym*nSym);
+
+    % --- QPSK Demodulation: decode I and Q separately ---
+    r_demod_I = real(r_F_qpsk);
+    r_demod_Q = imag(r_F_qpsk);
+    r_demod_I(r_demod_I > 0) = 1;   r_demod_I(r_demod_I < 0) = 0;
+    r_demod_Q(r_demod_Q > 0) = 1;   r_demod_Q(r_demod_Q < 0) = 0;
+    r_demod_I = reshape(r_demod_I.', 1, nSym/2 * nBit_Sym);
+    r_demod_Q = reshape(r_demod_Q.', 1, nSym/2 * nBit_Sym);
+    r_bit_qpsk = reshape([r_demod_I; r_demod_Q], 1, nBit_Sym*nSym);
+
+    % --- Count Bit Errors ---
+    nErr_bpsk(ii) = sum(r_bit_bpsk ~= s_bit);      % cleaner than find()
+    nErr_qpsk(ii) = sum(r_bit_qpsk ~= s_bit);
+
+end
+
+%% ============================================================
+%  BER CALCULATION
+% =============================================================
+simBer_bpsk = nErr_bpsk / (nSym * nBit_Sym);               % Simulated BER - BPSK
+simBer_qpsk = nErr_qpsk / (nSym * nBit_Sym);               % Simulated BER - QPSK
+theoryBer   = (1/2) * erfc(sqrt(10.^(EbN0dB/10)));         % Theoretical BER
+
+%% ============================================================
+%  PLOT RESULTS
+% =============================================================
+figure;
+semilogy(EbN0dB, simBer_bpsk,  '--*r', 'LineWidth', 2); hold on;
+semilogy(EbN0dB, simBer_qpsk,  '--*g', 'LineWidth', 2); hold on;
+semilogy(EbN0dB, theoryBer,    '--*b', 'LineWidth', 2);
+
+grid on;
+legend('BPSK (Simulated)', 'QPSK (Simulated)', 'Theoretical');
+xlabel('Eb/No (dB)');
+ylabel('Bit Error Rate');
+title('BER vs Eb/N0 — BPSK and QPSK over OFDM with LPF and AWGN Channel');
